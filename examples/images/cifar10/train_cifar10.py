@@ -17,6 +17,7 @@ from torchcfm.conditional_flow_matching import (
     ExactOptimalTransportConditionalFlowMatcher,
     TargetConditionalFlowMatcher,
     VariancePreservingConditionalFlowMatcher,
+    OptimalTransportEndPointConsistentFlowMatcher,
 )
 from torchcfm.models.unet.unet import UNetModelWrapper
 
@@ -38,6 +39,7 @@ flags.DEFINE_integer("batch_size", 128, help="batch size")  # Lipman et al uses 
 flags.DEFINE_integer("num_workers", 4, help="workers of Dataloader")
 flags.DEFINE_float("ema_decay", 0.9999, help="ema decay rate")
 flags.DEFINE_bool("parallel", False, help="multi gpu training")
+flags.DEFINE_float("eps", 0.01, help="clamp tol for ECRF")
 
 # Evaluation
 flags.DEFINE_integer(
@@ -114,7 +116,10 @@ def train(argv):
     for param in net_model.parameters():
         model_size += param.data.nelement()
     print("Model params: %.2f M" % (model_size / 1024 / 1024))
-
+    
+    # Zac throwing some garbage in here
+    eps = FLAGS.eps
+    batch = FLAGS.batch_size
     #################################
     #            OT-CFM
     #################################
@@ -128,6 +133,8 @@ def train(argv):
         FM = TargetConditionalFlowMatcher(sigma=sigma)
     elif FLAGS.model == "si":
         FM = VariancePreservingConditionalFlowMatcher(sigma=sigma)
+    elif FLAGS.model == "otcfm-erf":
+        FM = OptimalTransportEndPointConsistentFlowMatcher(sigma=sigma)
     else:
         raise NotImplementedError(
             f"Unknown model {FLAGS.model}, must be one of ['otcfm', 'icfm', 'fm', 'si']"
@@ -143,7 +150,13 @@ def train(argv):
             x0 = torch.randn_like(x1)
             t, xt, ut = FM.sample_location_and_conditional_flow(x0, x1)
             vt = net_model(t, xt)
-            loss = torch.mean((vt - ut) ** 2)
+            
+            # Big Change for ERF:
+            if FLAGS.model == "otcfm-erf":
+                w = 1 / (1 - t).pow(2).clip(eps, 1) # set weight
+                loss = ((vt - ut).pow(2).reshape(batch, -1).sum(dim=-1) * w).sum()/ w.sum()
+            else:
+                loss = torch.mean((vt - ut) ** 2)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(net_model.parameters(), FLAGS.grad_clip)  # new
             optim.step()

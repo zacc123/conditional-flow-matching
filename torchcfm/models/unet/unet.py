@@ -900,7 +900,7 @@ class UNetModelWrapper(UNetModel):
         for res in attention_resolutions.split(","):
             attention_ds.append(image_size // int(res))
 
-        return super().__init__(
+        super().__init__(
             image_size=image_size,
             in_channels=dim[0],
             model_channels=num_channels,
@@ -919,6 +919,8 @@ class UNetModelWrapper(UNetModel):
             resblock_updown=resblock_updown,
             use_new_attention_order=use_new_attention_order,
         )
+        self.nfe = 0
 
     def forward(self, t, x, y=None, *args, **kwargs):
+        self.nfe+=1
         return super().forward(t, x, y=y)

@@ -13,6 +13,9 @@ import torch
 
 from .optimal_transport import OTPlanSampler
 
+# Zac Addition, might not need
+# import ot as pot
+
 
 def pad_t_like_x(t, x):
     """Function to reshape the time vector t by the number of dimensions of x.
@@ -619,6 +622,97 @@ class VariancePreservingConditionalFlowMatcher(ConditionalFlowMatcher):
 
 
 class OptimalTransportEndPointConsistentFlowMatcher(ExactOptimalTransportConditionalFlowMatcher):
+    """Child class for EC-RF variant of OT-CFM from [1] and Tong.
+
+    This class implements the OT-CFM methods from [1] and inherits the ConditionalFlowMatcher
+    parent class, and adjusts the velocity target to predict x1 -xt.
+
+    It overrides the compute_conditional_flow.
+    """
+
+    def compute_conditional_flow(self, x0, x1, t, xt):
+        """
+        Compute the conditional vector field ut(x1|x0) = x1 - x0, see Eq.(15) [1].
+
+        Parameters
+        ----------
+        x0 : Tensor, shape (bs, *dim)
+            represents the source minibatch
+        x1 : Tensor, shape (bs, *dim)
+            represents the target minibatch
+        t : FloatTensor, shape (bs)
+        xt : Tensor, shape (bs, *dim)
+            represents the samples drawn from probability path pt
+
+        Returns
+        -------
+        ut : conditional vector field ut(x1|x0) = x1 - x0
+
+        References
+        ----------
+        [1] Improving and Generalizing Flow-Based Generative Models with minibatch optimal transport, Preprint, Tong et al.
+        """
+        del t
+        return x1 - xt
+    
+
+class EndPointConsistentFlowMatcher(ConditionalFlowMatcher):
+    """Child class for EC-RF variant of OT-CFM from [1] and Tong.
+
+    This class implements the OT-CFM methods from [1] and inherits the ConditionalFlowMatcher
+    parent class, and adjusts the velocity target to predict x1 -xt.
+
+    It overrides the compute_conditional_flow.
+    """
+
+    def compute_conditional_flow(self, x0, x1, t, xt):
+        """
+        Compute the conditional vector field ut(x1|x0) = x1 - x0, see Eq.(15) [1].
+
+        Parameters
+        ----------
+        x0 : Tensor, shape (bs, *dim)
+            represents the source minibatch
+        x1 : Tensor, shape (bs, *dim)
+            represents the target minibatch
+        t : FloatTensor, shape (bs)
+        xt : Tensor, shape (bs, *dim)
+            represents the samples drawn from probability path pt
+
+        Returns
+        -------
+        ut : conditional vector field ut(x1|x0) = x1 - x0
+
+        References
+        ----------
+        [1] Improving and Generalizing Flow-Based Generative Models with minibatch optimal transport, Preprint, Tong et al.
+        """
+        del t
+        return x1 - xt
+
+
+
+class NearestNeighborConditionalFlowMatcher(ConditionalFlowMatcher):
+    """Nearest neighbor coupling conditional flow matching.
+    
+    Overrides sample_location_and_conditional_flow to couple 
+    (x0, x1) pairs by nearest neighbor in batch before computing the flow.
+    """
+
+    # Adding in NN coupling
+    def get_nn(self, x0, x1):
+        batch = x0.shape[0]
+        # a, b = pot.unif(batch), pot.unif(batch)
+        M = torch.cdist(x0.reshape(batch, -1), x1.reshape(batch, -1)) ** 2
+        j = M.argmin(axis=-1)
+        return x0, x1[j]
+
+    def sample_location_and_conditional_flow(self, x0, x1, t=None, return_noise=False):
+        x0, x1 = self.get_nn(x0, x1)
+        return super().sample_location_and_conditional_flow(x0, x1, t, return_noise)
+
+
+class NearestNeighborEndPointConsistentFlowMatcher(NearestNeighborConditionalFlowMatcher):
     """Child class for EC-RF variant of OT-CFM from [1] and Tong.
 
     This class implements the OT-CFM methods from [1] and inherits the ConditionalFlowMatcher

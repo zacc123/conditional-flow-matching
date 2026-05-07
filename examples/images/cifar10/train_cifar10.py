@@ -5,6 +5,8 @@
 
 import copy
 import os
+import numpy as np
+import random
 
 import torch
 from absl import app, flags
@@ -18,6 +20,9 @@ from torchcfm.conditional_flow_matching import (
     TargetConditionalFlowMatcher,
     VariancePreservingConditionalFlowMatcher,
     OptimalTransportEndPointConsistentFlowMatcher,
+    NearestNeighborEndPointConsistentFlowMatcher,
+    EndPointConsistentFlowMatcher,
+    NearestNeighborConditionalFlowMatcher,
 )
 from torchcfm.models.unet.unet import UNetModelWrapper
 
@@ -39,7 +44,14 @@ flags.DEFINE_integer("batch_size", 128, help="batch size")  # Lipman et al uses 
 flags.DEFINE_integer("num_workers", 4, help="workers of Dataloader")
 flags.DEFINE_float("ema_decay", 0.9999, help="ema decay rate")
 flags.DEFINE_bool("parallel", False, help="multi gpu training")
+
+#   Additions
 flags.DEFINE_float("eps", 0.01, help="clamp tol for ECRF")
+flags.DEFINE_bool("resume", False, help="flag to resume training from a checkpoint")
+flags.DEFINE_integer("ckpt", 0, help="flag to specify where to start from")
+flags.DEFINE_bool("time_free", False, help="flag to set t in the model to 0")
+
+flags.DEFINE_bool("skip_train", False, help="Use to Generate Samples only from a given checkpoint")
 
 # Evaluation
 flags.DEFINE_integer(
@@ -117,7 +129,7 @@ def train(argv):
         model_size += param.data.nelement()
     print("Model params: %.2f M" % (model_size / 1024 / 1024))
     
-    # Zac throwing some garbage in here
+    #   throwing some garbage in here
     eps = FLAGS.eps
     batch = FLAGS.batch_size
     #################################
@@ -129,54 +141,98 @@ def train(argv):
         FM = ExactOptimalTransportConditionalFlowMatcher(sigma=sigma)
     elif FLAGS.model == "icfm":
         FM = ConditionalFlowMatcher(sigma=sigma)
+    elif FLAGS.model == "icfm-erf":
+        FM = EndPointConsistentFlowMatcher(sigma=sigma)
     elif FLAGS.model == "fm":
         FM = TargetConditionalFlowMatcher(sigma=sigma)
     elif FLAGS.model == "si":
         FM = VariancePreservingConditionalFlowMatcher(sigma=sigma)
     elif FLAGS.model == "otcfm-erf":
         FM = OptimalTransportEndPointConsistentFlowMatcher(sigma=sigma)
+    elif FLAGS.model == "nnfm-erf":
+        FM = NearestNeighborEndPointConsistentFlowMatcher(sigma=sigma)
+    elif FLAGS.model == "nnfm":
+        FM = NearestNeighborConditionalFlowMatcher(sigma=sigma)
     else:
         raise NotImplementedError(
-            f"Unknown model {FLAGS.model}, must be one of ['otcfm', 'icfm', 'fm', 'si']"
+            f"Unknown model {FLAGS.model}, must be one of ['otcfm', 'icfm', 'fm', 'si', 'otcfm-erf', 'nnfm', 'nnfm-erf', 'icfm-erf', 'nnfm']"
         )
 
-    savedir = FLAGS.output_dir + FLAGS.model + "/"
+    if FLAGS.time_free:
+        savedir = FLAGS.output_dir + FLAGS.model + "_tf" + "/"
+    else:
+        savedir = FLAGS.output_dir + FLAGS.model + "/"
     os.makedirs(savedir, exist_ok=True)
 
-    with trange(FLAGS.total_steps, dynamic_ncols=True) as pbar:
-        for step in pbar:
-            optim.zero_grad()
-            x1 = next(datalooper).to(device)
-            x0 = torch.randn_like(x1)
-            t, xt, ut = FM.sample_location_and_conditional_flow(x0, x1)
-            vt = net_model(t, xt)
-            
-            # Big Change for ERF:
-            if FLAGS.model == "otcfm-erf":
-                w = 1 / (1 - t).pow(2).clip(eps, 1) # set weight
-                loss = ((vt - ut).pow(2).reshape(batch, -1).sum(dim=-1) * w).sum()/ w.sum()
-            else:
-                loss = torch.mean((vt - ut) ** 2)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(net_model.parameters(), FLAGS.grad_clip)  # new
-            optim.step()
-            sched.step()
-            ema(net_model, ema_model, FLAGS.ema_decay)  # new
+    erf_modes = ['otcfm-erf', 'icfm-erf', 'nnfm-erf']
 
-            # sample and Saving the weights
-            if FLAGS.save_step > 0 and step % FLAGS.save_step == 0:
-                generate_samples(net_model, FLAGS.parallel, savedir, step, net_="normal")
-                generate_samples(ema_model, FLAGS.parallel, savedir, step, net_="ema")
-                torch.save(
-                    {
-                        "net_model": net_model.state_dict(),
-                        "ema_model": ema_model.state_dict(),
-                        "sched": sched.state_dict(),
-                        "optim": optim.state_dict(),
-                        "step": step,
-                    },
-                    savedir + f"{FLAGS.model}_cifar10_weights_step_{step}.pt",
-                )
+    
+
+    # Adding in checkpointing with resume
+    if FLAGS.resume:
+        checkpoint = torch.load(savedir + f"{FLAGS.model}_cifar10_weights_step_{FLAGS.ckpt}.pt")
+        net_model.load_state_dict(checkpoint["net_model"])
+        ema_model.load_state_dict(checkpoint["ema_model"])
+        optim.load_state_dict(checkpoint["optim"])
+        sched.load_state_dict(checkpoint["sched"])
+        start_step = checkpoint["step"]
+    else: 
+        start_step = 0
+    if not FLAGS.skip_train:
+        with trange(start_step, FLAGS.total_steps, dynamic_ncols=True) as pbar:
+            for step in pbar:
+                optim.zero_grad()
+                x1 = next(datalooper).to(device)
+                x0 = torch.randn_like(x1)
+                t, xt, ut = FM.sample_location_and_conditional_flow(x0, x1)
+                
+                if FLAGS.time_free:
+                    _t = torch.zeros_like(t)
+                else:
+                    _t = t
+
+                vt = net_model(_t, xt)
+                
+                # Big Change for ERF:
+                if FLAGS.model in erf_modes:
+                    w = 1 / (1 - t).pow(2).clip(eps, 1) # set weight
+                    loss = ((vt - ut).pow(2).reshape(batch, -1).sum(dim=-1) * w).sum()/ w.sum()
+                elif FLAGS.model == 'otcfm-erf' or FLAGS.model == 'icfm-erf' or FLAGS.model =='nnfm-erf':
+                    raise RuntimeError("Something is wrong")
+                else:
+                    loss = torch.mean((vt - ut) ** 2)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(net_model.parameters(), FLAGS.grad_clip)  # new
+                optim.step()
+                sched.step()
+                ema(net_model, ema_model, FLAGS.ema_decay)  # new
+
+                ecrf_flag = FLAGS.model in erf_modes
+
+
+                # sample and Saving the weights
+                if FLAGS.save_step > 0 and step % FLAGS.save_step == 0:
+                    generate_samples(net_model, FLAGS.parallel, savedir, step, net_="normal", ecrf=ecrf_flag, time_free=FLAGS.time_free)
+                    generate_samples(ema_model, FLAGS.parallel, savedir, step, net_="ema", ecrf=ecrf_flag, time_free=FLAGS.time_free)
+                    torch.save(
+                        {
+                            "net_model": net_model.state_dict(),
+                            "ema_model": ema_model.state_dict(),
+                            "sched": sched.state_dict(),
+                            "optim": optim.state_dict(),
+                            "step": step,
+                        },
+                        savedir + f"{FLAGS.model}_cifar10_weights_step_{step}.pt",
+                    )
+    else:
+        step = FLAGS.ckpt
+        ecrf_flag = FLAGS.model in erf_modes
+        torch.manual_seed(0)
+        np.random.seed(0)
+        random.seed(0)
+        generate_samples(net_model, FLAGS.parallel, savedir, step, net_="normal", ecrf=ecrf_flag, time_free=FLAGS.time_free)
+        generate_samples(ema_model, FLAGS.parallel, savedir, step, net_="ema", ecrf=ecrf_flag, time_free=FLAGS.time_free)
+
 
 
 if __name__ == "__main__":

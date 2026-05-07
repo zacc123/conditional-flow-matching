@@ -12,6 +12,7 @@ from torchdiffeq import odeint
 from torchdyn.core import NeuralODE
 
 from torchcfm.models.unet.unet import UNetModelWrapper
+from utils_cifar import ERFWrapper, ERFWrapperTF, WrapperTF # Add this 
 
 FLAGS = flags.FLAGS
 # UNet
@@ -26,7 +27,7 @@ flags.DEFINE_integer("step", 400000, help="training steps")
 flags.DEFINE_integer("num_gen", 50000, help="number of samples to generate")
 flags.DEFINE_float("tol", 1e-5, help="Integrator tolerance (absolute and relative)")
 flags.DEFINE_integer("batch_size_fid", 1024, help="Batch size to compute FID")
-
+flags.DEFINE_bool("time_free", False, help="Use Time-Free")
 FLAGS(sys.argv)
 
 
@@ -45,9 +46,12 @@ new_net = UNetModelWrapper(
     dropout=0.1,
 ).to(device)
 
-
+if FLAGS.time_free:
+    PATH = f"{FLAGS.input_dir}/{FLAGS.model}_tf/{FLAGS.model}_cifar10_weights_step_{FLAGS.step}.pt"
+else:
+    PATH = f"{FLAGS.input_dir}/{FLAGS.model}/{FLAGS.model}_cifar10_weights_step_{FLAGS.step}.pt"
 # Load the model
-PATH = f"{FLAGS.input_dir}/{FLAGS.model}/{FLAGS.model}_cifar10_weights_step_{FLAGS.step}.pt"
+
 print("path: ", PATH)
 checkpoint = torch.load(PATH, map_location=device)
 state_dict = checkpoint["ema_model"]
@@ -62,6 +66,16 @@ except RuntimeError:
     new_net.load_state_dict(new_state_dict)
 new_net.eval()
 
+
+
+if FLAGS.time_free and (FLAGS.model == "otcfm-erf" or FLAGS.model == "nnfm-erf" or FLAGS.model == "icfm-erf"):
+    new_net = ERFWrapperTF(new_net)
+elif (FLAGS.model == "otcfm-erf" or FLAGS.model == "nnfm-erf" or FLAGS.model == "icfm-erf"):
+    new_net = ERFWrapper(new_net)
+elif FLAGS.time_free and not (FLAGS.model == "otcfm-erf" or FLAGS.model == "nnfm-erf" or FLAGS.model == "icfm-erf"):
+    new_net = WrapperTF(new_net)
+else:
+    new_net = new_net
 
 # Define the integration method if euler is used
 if FLAGS.integration_method == "euler":
@@ -103,7 +117,8 @@ score = fid.compute_fid(
 )
 print()
 print("FID has been computed")
-# print()
-# print("Total NFE: ", new_net.nfe)
+print()
+#if FLAGS.integration_method == "dopri5":
+print("Total NFE: ", new_net.nfe)
 print()
 print("FID: ", score)

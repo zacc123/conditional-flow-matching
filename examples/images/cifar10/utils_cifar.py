@@ -11,6 +11,69 @@ from torchvision.utils import save_image
 use_cuda = torch.cuda.is_available()
 device = torch.device("cuda" if use_cuda else "cpu")
 
+#   Addition to rescale model output
+class ERFWrapper(torch.nn.Module):
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+        self.nfe = 0
+    
+    @property
+    def nfe(self):
+        return self.model.nfe
+    
+    @nfe.setter
+    def nfe(self, value):
+        self.model.nfe = value  # ← setting nfe on wrapper sets it on inner model too
+    
+    def forward(self, t, x, *args, **kwargs):
+        ut = self.model(t, x)
+        # convert x1 - xt prediction back to standard velocity
+        return ut / (1 - t)
+    
+#   Addition to rescale model output
+class ERFWrapperTF(torch.nn.Module):
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+        self.nfe = 0
+    
+    @property
+    def nfe(self):
+        return self.model.nfe
+    
+    @nfe.setter
+    def nfe(self, value):
+        self.model.nfe = value  # ← setting nfe on wrapper sets it on inner model too
+
+    def forward(self, t, x, *args, **kwargs):
+        _t = torch.zeros_like(t)
+        ut = self.model(_t, x)
+        # convert x1 - xt prediction back to standard velocity
+        return ut / (1 - t).clamp(min=1e-5)
+    
+#   Addition to rescale model output
+class WrapperTF(torch.nn.Module):
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+        self.nfe = 0
+    
+    @property
+    def nfe(self):
+        return self.model.nfe
+    
+    @nfe.setter
+    def nfe(self, value):
+        self.model.nfe = value  # ← setting nfe on wrapper sets it on inner model too
+
+    def forward(self, t, x, *args, **kwargs):
+        _t = torch.zeros_like(t)
+        ut = self.model(_t, x)
+        # convert x1 - xt prediction back to standard velocity
+        return ut
+
+
 
 def setup(
     rank: int,
@@ -39,7 +102,7 @@ def setup(
     )
 
 
-def generate_samples(model, parallel, savedir, step, net_="normal"):
+def generate_samples(model, parallel, savedir, step, net_="normal", ecrf=False, time_free=False):
     """Save 64 generated images (8 x 8) for sanity check along training.
 
     Parameters
@@ -60,7 +123,16 @@ def generate_samples(model, parallel, savedir, step, net_="normal"):
         # Send the models from GPU to CPU for inference with NeuralODE from Torchdyn
         model_ = model_.module.to(device)
 
+    if time_free and ecrf:
+        model_ = ERFWrapperTF(model_)
+    elif ecrf and not time_free:
+        model_ = ERFWrapper(model_)
+    elif not ecrf and time_free:
+        model_ = WrapperTF(model_)
+    else: 
+        model_ = model_
     node_ = NeuralODE(model_, solver="euler", sensitivity="adjoint")
+    #node_ = NeuralODE(model_, solver="euler", sensitivity="adjoint")
     with torch.no_grad():
         traj = node_.trajectory(
             torch.randn(64, 3, 32, 32, device=device),
